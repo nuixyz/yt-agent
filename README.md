@@ -385,6 +385,9 @@ Confirm the server is running (`ollama serve`, or check it's running as a backgr
 **Transcript extraction fails on every video**
 YouTube's DOM structure changes periodically. Check the selectors in `graph/nodes.py` (`TRANSCRIPT_BUTTON_SELECTOR`, `TRANSCRIPT_PANEL_SELECTOR`, etc.) against the current page — some videos also simply don't have captions available, which will correctly show up as a per-video error rather than crash the run.
 
+**Playlist page times out / "did not load video items in time"**
+This is most commonly a **cookie-consent interstitial** ("Before you continue to YouTube") blocking the page on a fresh browser profile — it can appear even when the session is otherwise signed in. The agent tries to dismiss this automatically before waiting for playlist content, but if it still fails, check `outputs/_debug/` — every timeout in `navigate_playlist` or `extract_video_list` saves a screenshot (`.png`) and full HTML snapshot (`.html`) of what the page actually looked like at the moment of failure, so you can see exactly what's blocking it instead of guessing from a bare timeout message.
+
 **LLM responses keep failing to parse as JSON**
 Try a different model — smaller/less-instructable models sometimes ignore formatting instructions more often. `qwen2.5:7b` and `llama3.1:8b` have both proven reliable for structured JSON output.
 
@@ -396,4 +399,3 @@ Try a different model — smaller/less-instructable models sometimes ignore form
 - No automatic retry at the graph level for transient failures (e.g. a slow network causing a one-off timeout) — by design, but worth reconsidering if run against flakier networks.
 - The background scheduler runs against a single fixed `DEFAULT_PLAYLIST_URL`; supporting multiple scheduled playlists would need a small extension (e.g. a list of playlist configs instead of one URL).
 - No persistence/database layer — each run's digest is a standalone file; there's no cross-run deduplication if the same video appears in multiple runs.
-s

@@ -23,6 +23,50 @@ TRANSCRIPT_PANEL_SELECTOR = "ytd-transcript-segment-list-renderer"
 
 DEFAULT_WAIT_MS = 15000
 
+CONSENT_BUTTON_SELECTORS = [
+    "button:has-text('Accept all')",
+    "button:has-text('I agree')",
+    "form[action*='consent'] button",
+    "#introAgreeButton",
+]
+
+DEBUG_DIR = Path("./outputs/_debug")
+
+
+async def _dismiss_consent_if_present(page: Page, *, timeout_ms: int = 3000) -> None:
+    for selector in CONSENT_BUTTON_SELECTORS:
+        try:
+            btn = await page.wait_for_selector(selector, timeout=timeout_ms)
+            if btn:
+                await btn.click()
+                logger.info("Dismissed a consent dialog via selector: %s", selector)
+                await page.wait_for_timeout(1000)  # let the dialog close
+                return
+        except PlaywrightTimeoutError:
+            continue
+        except Exception as e:
+            logger.debug("Consent dismissal attempt failed for %s: %s", selector, e)
+            continue
+
+
+async def _capture_debug_artifacts(page: Page, *, stage: str, video_id: str = "playlist") -> str | None:
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        base = DEBUG_DIR / f"{stage}_{video_id}_{timestamp}"
+        screenshot_path = f"{base}.png"
+        html_path = f"{base}.html"
+
+        await page.screenshot(path=screenshot_path, full_page=True)
+        html = await page.content()
+        Path(html_path).write_text(html, encoding="utf-8")
+
+        logger.info("Saved debug artifacts: %s , %s", screenshot_path, html_path)
+        return screenshot_path
+    except Exception as e:
+        logger.warning("Failed to capture debug artifacts: %s", e)
+        return None
+
 
 def _video_id_from_url(url: str) -> str | None:
     match = re.search(r"[?&]v=([\w-]+)", url)
@@ -35,15 +79,20 @@ async def navigate_playlist(state: AgentState) -> dict:
     async with camoufox_session() as page:
         try:
             await page.goto(state.playlist_url, wait_until="domcontentloaded")
+            await _dismiss_consent_if_present(page)
             await page.wait_for_selector(
                 PLAYLIST_ITEM_SELECTOR, timeout=DEFAULT_WAIT_MS
             )
         except PlaywrightTimeoutError as e:
+            debug_path = await _capture_debug_artifacts(page, stage="navigate_playlist")
+            hint = f" (screenshot saved to {debug_path})" if debug_path else ""
             return {
                 "errors": [
                     VideoError(
                         stage="navigate_playlist",
-                        message=f"Playlist page did not load video items in time: {e}",
+                        message=(
+                            f"Playlist page did not load video items in time: {e}{hint}"
+                        ),
                     )
                 ]
             }
@@ -56,16 +105,19 @@ async def extract_video_list(state: AgentState) -> dict:
 
     async with camoufox_session() as page:
         await page.goto(state.playlist_url, wait_until="domcontentloaded")
+        await _dismiss_consent_if_present(page)
         try:
             await page.wait_for_selector(
                 PLAYLIST_ITEM_SELECTOR, timeout=DEFAULT_WAIT_MS
             )
         except PlaywrightTimeoutError as e:
+            debug_path = await _capture_debug_artifacts(page, stage="extract_video_list")
+            hint = f" (screenshot saved to {debug_path})" if debug_path else ""
             return {
                 "errors": [
                     VideoError(
                         stage="extract_video_list",
-                        message=f"No playlist items found: {e}",
+                        message=f"No playlist items found: {e}{hint}",
                     )
                 ]
             }
@@ -89,7 +141,7 @@ async def extract_video_list(state: AgentState) -> dict:
                 videos.append(
                     VideoRef(video_id=video_id, url=url, title=title, position=position)
                 )
-            except Exception as e:  # skip upon finding a bad item in the playlist
+            except Exception as e:
                 logger.warning("Skipping unparsable playlist item at position %d: %s", position, e)
                 continue
 
@@ -214,7 +266,7 @@ async def summarize_node(state: AgentState) -> dict:
 
     try:
         note: StudyNote = await summarize_transcript(video=video, transcript=transcript)
-    except Exception as e:  # LLM parsing failures doesn't kill the run
+    except Exception as e:
         return {
             "current_video": None,
             "current_transcript": None,
