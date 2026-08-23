@@ -1,3 +1,21 @@
+"""
+LangGraph node functions for the YouTube Study Agent.
+
+Each node takes the current AgentState and returns a partial state update
+(a dict of the fields it changed). LangGraph merges these into the running
+state using each field's reducer (see graph/state.py).
+
+Nodes are deliberately narrow and single-purpose so each is independently
+testable:
+    navigate_playlist    -> opens the playlist page
+    extract_video_list   -> scrapes video refs, applies the run cap, seeds queue
+    open_video            -> opens the next pending video
+    extract_transcript    -> pulls transcript text via DOM, with dynamic waits
+    summarize_node        -> calls the LLM to turn a transcript into a StudyNote
+    write_markdown         -> renders all notes/errors to a Markdown digest on disk
+    handle_error            -> records a VideoError and advances the queue
+"""
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +32,15 @@ from llm.summarizer import summarize_transcript
 
 logger = logging.getLogger(__name__)
 
+# --- Selectors (YouTube's DOM; kept centralized so they're easy to patch) ---
+#
+# YouTube has migrated playlist item rendering from the old
+# `ytd-playlist-video-renderer` custom element to a newer `yt-lockup-view-model`
+# component (observed via debug HTML dumps on 2026-08-23). Rather than
+# hardcode a single selector that will break again the next time YouTube
+# changes this, we try a list of strategies in order and use whichever one
+# actually matches -- this is also just genuinely more resilient to A/B
+# tests, where different accounts can see different DOM structures.
 PLAYLIST_ITEM_STRATEGIES: list[dict[str, str]] = [
     {
         "item": "yt-lockup-view-model",
@@ -25,14 +52,83 @@ PLAYLIST_ITEM_STRATEGIES: list[dict[str, str]] = [
     },
 ]
 SELECTOR_DETECT_TIMEOUT_MS = 6000
+DEFAULT_WAIT_MS = 15000
 
 TRANSCRIPT_BUTTON_SELECTOR = 'button[aria-label*="transcript" i]'
-TRANSCRIPT_MORE_ACTIONS_SELECTOR = "button#expand"  # "...more" under description
+
+# YouTube renders multiple copies of some buttons for different layouts/
+# breakpoints and toggles visibility via CSS rather than removing the
+# duplicates from the DOM (confirmed via debug HTML on 2026-08-23: the
+# transcript button selector matched 4 elements simultaneously). A plain
+# wait_for_selector() locks onto the *first* DOM match regardless of
+# whether it's the visible one, so it can time out waiting on a
+# display:none duplicate even while the "real" one is sitting on screen.
+# This helper explicitly finds and clicks whichever match is actually
+# visible.
+async def _click_first_visible(
+    page: Page, selector: str, *, timeout_ms: int = DEFAULT_WAIT_MS
+) -> bool:
+    """Polls for at least one element matching `selector` to be genuinely
+    visible (not just present in the DOM) and clicks it. Returns True on
+    success, False if none became visible within the timeout."""
+    deadline = timeout_ms / 1000
+    elapsed = 0.0
+    interval = 0.5
+    while elapsed < deadline:
+        candidates = await page.query_selector_all(selector)
+        for el in candidates:
+            try:
+                if await el.is_visible():
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    return True
+            except Exception:
+                continue
+        await page.wait_for_timeout(int(interval * 1000))
+        elapsed += interval
+    return False
+
+
+# Candidate selectors for the "expand description" toggle, tried in order.
+# YouTube has changed this element's id/structure across redesigns (the
+# playlist page migration to yt-lockup-view-model suggests the watch page
+# has drifted too), so we don't rely on a single hardcoded id.
+EXPAND_DESCRIPTION_SELECTORS = [
+    "#expand",
+    "tp-yt-paper-button#expand",
+    "button:has-text('...more')",
+    "button:has-text('more')",
+]
+
+
+async def _expand_description_if_present(page: Page, *, timeout_ms: int = 4000) -> None:
+    """Best-effort click of the description's expand/'...more' toggle,
+    trying several known selector variants. Silently does nothing if none
+    match -- the description may already be expanded, or absent."""
+    for selector in EXPAND_DESCRIPTION_SELECTORS:
+        try:
+            btn = await page.wait_for_selector(selector, timeout=timeout_ms)
+            if btn and await btn.is_visible():
+                await btn.click()
+                logger.info("Expanded description via selector: %s", selector)
+                await page.wait_for_timeout(500)
+                return
+        except PlaywrightTimeoutError:
+            continue
+        except Exception as e:  # noqa: BLE001 - never let this block the real flow
+            logger.debug("Expand-description attempt failed for %s: %s", selector, e)
+            continue
+
+
 TRANSCRIPT_SEGMENT_SELECTOR = "ytd-transcript-segment-renderer"
 TRANSCRIPT_PANEL_SELECTOR = "ytd-transcript-segment-list-renderer"
 
-DEFAULT_WAIT_MS = 15000
-
+# YouTube/Google sometimes shows a cookie-consent interstitial ("Before you
+# continue to YouTube") on a fresh browser profile, even when the session is
+# otherwise authenticated. It renders on top of the page and blocks the
+# playlist/video content underneath from ever appearing, which looks
+# identical to a normal timeout unless you know to look for it. We try to
+# dismiss it opportunistically before waiting on real page content.
 CONSENT_BUTTON_SELECTORS = [
     "button:has-text('Accept all')",
     "button:has-text('I agree')",
@@ -44,6 +140,9 @@ DEBUG_DIR = Path("./outputs/_debug")
 
 
 async def _detect_playlist_strategy(page: Page) -> dict[str, str] | None:
+    """Tries each known playlist-item selector strategy in order and returns
+    the first one that actually matches the current page's DOM. Returns
+    None if none of them do (caller treats this as a load failure)."""
     for strategy in PLAYLIST_ITEM_STRATEGIES:
         try:
             await page.wait_for_selector(
@@ -57,23 +156,28 @@ async def _detect_playlist_strategy(page: Page) -> dict[str, str] | None:
 
 
 async def _dismiss_consent_if_present(page: Page, *, timeout_ms: int = 3000) -> None:
+    """Best-effort click of a cookie-consent dialog if one is present.
+    Silently does nothing if no such dialog appears within the short
+    timeout -- this must never block the main flow."""
     for selector in CONSENT_BUTTON_SELECTORS:
         try:
             btn = await page.wait_for_selector(selector, timeout=timeout_ms)
             if btn:
                 await btn.click()
                 logger.info("Dismissed a consent dialog via selector: %s", selector)
-                await page.wait_for_timeout(1000)  # let the dialog close
+                await page.wait_for_timeout(1000)  # let the dialog close/animate out
                 return
         except PlaywrightTimeoutError:
             continue
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - never let consent-handling break the run
             logger.debug("Consent dismissal attempt failed for %s: %s", selector, e)
             continue
 
 
 async def _capture_debug_artifacts(page: Page, *, stage: str, video_id: str = "playlist") -> str | None:
-    # Saves a screenshot + HTML snapshot on failure
+    """Saves a screenshot + HTML snapshot on failure so timeouts are
+    diagnosable after the fact instead of a bare 'timeout exceeded'.
+    Returns the screenshot path, or None if capture itself failed."""
     try:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -87,7 +191,7 @@ async def _capture_debug_artifacts(page: Page, *, stage: str, video_id: str = "p
 
         logger.info("Saved debug artifacts: %s , %s", screenshot_path, html_path)
         return screenshot_path
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - debug capture must never mask the real error
         logger.warning("Failed to capture debug artifacts: %s", e)
         return None
 
@@ -97,8 +201,13 @@ def _video_id_from_url(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+# ---------------------------------------------------------------------------
 # Node: navigate_playlist
+# ---------------------------------------------------------------------------
 async def navigate_playlist(state: AgentState) -> dict:
+    """Opens the playlist page. Actual scraping happens in extract_video_list
+    (kept separate so navigation failures are distinguishable from parse
+    failures in logs/errors)."""
     logger.info("Navigating to playlist: %s", state.playlist_url)
     async with camoufox_session() as page:
         try:
@@ -122,11 +231,17 @@ async def navigate_playlist(state: AgentState) -> dict:
                     )
                 ]
             }
+    # Nothing to persist in state here beyond confirming success; the real
+    # extraction (which needs its own page context) happens next.
     return {}
 
 
+# ---------------------------------------------------------------------------
 # Node: extract_video_list
+# ---------------------------------------------------------------------------
 async def extract_video_list(state: AgentState) -> dict:
+    """Scrapes video refs from the playlist page, applies the configured cap,
+    and seeds the processing queue."""
     videos: list[VideoRef] = []
 
     async with camoufox_session() as page:
@@ -188,7 +303,9 @@ async def extract_video_list(state: AgentState) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
 # Node: open_video
+# ---------------------------------------------------------------------------
 async def open_video(state: AgentState) -> dict:
     """Pops the next pending video ID off the queue and sets it as current."""
     if not state.pending_video_ids:
@@ -199,6 +316,7 @@ async def open_video(state: AgentState) -> dict:
     video = next((v for v in state.videos if v.video_id == next_id), None)
 
     if video is None:
+        # Shouldn't happen, but keep the queue moving rather than stalling.
         return {
             "pending_video_ids": remaining,
             "errors": [
@@ -213,8 +331,12 @@ async def open_video(state: AgentState) -> dict:
     return {"pending_video_ids": remaining, "current_video": video}
 
 
+# ---------------------------------------------------------------------------
 # Node: extract_transcript
+# ---------------------------------------------------------------------------
 async def extract_transcript(state: AgentState) -> dict:
+    """Opens the current video and extracts its transcript via the DOM,
+    using dynamic waits rather than fixed sleeps at every step."""
     video = state.current_video
     if video is None:
         return {}
@@ -222,23 +344,24 @@ async def extract_transcript(state: AgentState) -> dict:
     async with camoufox_session() as page:
         try:
             await page.goto(video.url, wait_until="domcontentloaded")
-            try:
-                expand_btn = await page.wait_for_selector(
-                    TRANSCRIPT_MORE_ACTIONS_SELECTOR, timeout=5000
-                )
-                if expand_btn:
-                    await expand_btn.click()
-            except PlaywrightTimeoutError:
-                pass
 
-            transcript_btn = await page.wait_for_selector(
-                TRANSCRIPT_BUTTON_SELECTOR, timeout=DEFAULT_WAIT_MS
-            )
-            await transcript_btn.click()
+            # Expand description area first; the transcript button often
+            # only renders once the description panel is open.
+            await _expand_description_if_present(page)
+
+            clicked = await _click_first_visible(page, TRANSCRIPT_BUTTON_SELECTOR)
+            if not clicked:
+                raise PlaywrightTimeoutError(
+                    "No visible 'Show transcript' button found "
+                    "(matches existed in the DOM but none were visible)."
+                )
 
             await page.wait_for_selector(
                 TRANSCRIPT_PANEL_SELECTOR, timeout=DEFAULT_WAIT_MS
             )
+            # Give lazy-loaded segments a moment to populate after the panel
+            # itself is present (dynamic wait, not a blind sleep -- we wait
+            # for at least one segment node to exist).
             await page.wait_for_selector(
                 TRANSCRIPT_SEGMENT_SELECTOR, timeout=DEFAULT_WAIT_MS
             )
@@ -253,6 +376,10 @@ async def extract_transcript(state: AgentState) -> dict:
             transcript = "\n".join(lines)
 
         except PlaywrightTimeoutError as e:
+            debug_path = await _capture_debug_artifacts(
+                page, stage="extract_transcript", video_id=video.video_id
+            )
+            hint = f" (screenshot saved to {debug_path})" if debug_path else ""
             return {
                 "current_video": None,
                 "errors": [
@@ -260,7 +387,7 @@ async def extract_transcript(state: AgentState) -> dict:
                         video_id=video.video_id,
                         url=video.url,
                         stage="extract_transcript",
-                        message=f"Transcript unavailable or failed to load: {e}",
+                        message=f"Transcript unavailable or failed to load: {e}{hint}",
                     )
                 ],
             }
@@ -281,7 +408,9 @@ async def extract_transcript(state: AgentState) -> dict:
     return {"current_transcript": transcript}
 
 
+# ---------------------------------------------------------------------------
 # Node: summarize_node
+# ---------------------------------------------------------------------------
 async def summarize_node(state: AgentState) -> dict:
     """Calls the local LLM to turn the current transcript into a StudyNote."""
     video = state.current_video
@@ -291,7 +420,7 @@ async def summarize_node(state: AgentState) -> dict:
 
     try:
         note: StudyNote = await summarize_transcript(video=video, transcript=transcript)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - LLM/parsing failures shouldn't kill the run
         return {
             "current_video": None,
             "current_transcript": None,
@@ -312,13 +441,22 @@ async def summarize_node(state: AgentState) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
 # Node: handle_error
+# ---------------------------------------------------------------------------
 async def handle_error(state: AgentState) -> dict:
+    """Clears per-video scratch state so the loop can continue to the next
+    pending video after a failure. Errors themselves are already appended
+    by whichever node raised them."""
     return {"current_video": None, "current_transcript": None}
 
 
+# ---------------------------------------------------------------------------
 # Node: write_markdown
+# ---------------------------------------------------------------------------
 async def write_markdown(state: AgentState) -> dict:
+    """Renders all accumulated notes (and any errors) into a single Markdown
+    digest and writes it to OUTPUT_DIR."""
     settings.ensure_dirs()
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     out_path = Path(settings.output_dir) / f"digest_{timestamp}.md"
