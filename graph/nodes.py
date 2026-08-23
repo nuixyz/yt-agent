@@ -14,8 +14,18 @@ from llm.summarizer import summarize_transcript
 
 logger = logging.getLogger(__name__)
 
-PLAYLIST_ITEM_SELECTOR = "ytd-playlist-video-renderer"
-PLAYLIST_ITEM_TITLE_SELECTOR = "#video-title"
+PLAYLIST_ITEM_STRATEGIES: list[dict[str, str]] = [
+    {
+        "item": "yt-lockup-view-model",
+        "title": "a.ytLockupMetadataViewModelTitle",
+    },
+    {
+        "item": "ytd-playlist-video-renderer",
+        "title": "#video-title",
+    },
+]
+SELECTOR_DETECT_TIMEOUT_MS = 6000
+
 TRANSCRIPT_BUTTON_SELECTOR = 'button[aria-label*="transcript" i]'
 TRANSCRIPT_MORE_ACTIONS_SELECTOR = "button#expand"  # "...more" under description
 TRANSCRIPT_SEGMENT_SELECTOR = "ytd-transcript-segment-renderer"
@@ -31,6 +41,19 @@ CONSENT_BUTTON_SELECTORS = [
 ]
 
 DEBUG_DIR = Path("./outputs/_debug")
+
+
+async def _detect_playlist_strategy(page: Page) -> dict[str, str] | None:
+    for strategy in PLAYLIST_ITEM_STRATEGIES:
+        try:
+            await page.wait_for_selector(
+                strategy["item"], timeout=SELECTOR_DETECT_TIMEOUT_MS
+            )
+            logger.info("Playlist item selector matched: %s", strategy["item"])
+            return strategy
+        except PlaywrightTimeoutError:
+            continue
+    return None
 
 
 async def _dismiss_consent_if_present(page: Page, *, timeout_ms: int = 3000) -> None:
@@ -50,6 +73,7 @@ async def _dismiss_consent_if_present(page: Page, *, timeout_ms: int = 3000) -> 
 
 
 async def _capture_debug_artifacts(page: Page, *, stage: str, video_id: str = "playlist") -> str | None:
+    # Saves a screenshot + HTML snapshot on failure
     try:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -80,9 +104,11 @@ async def navigate_playlist(state: AgentState) -> dict:
         try:
             await page.goto(state.playlist_url, wait_until="domcontentloaded")
             await _dismiss_consent_if_present(page)
-            await page.wait_for_selector(
-                PLAYLIST_ITEM_SELECTOR, timeout=DEFAULT_WAIT_MS
-            )
+            strategy = await _detect_playlist_strategy(page)
+            if strategy is None:
+                raise PlaywrightTimeoutError(
+                    "None of the known playlist-item selectors matched."
+                )
         except PlaywrightTimeoutError as e:
             debug_path = await _capture_debug_artifacts(page, stage="navigate_playlist")
             hint = f" (screenshot saved to {debug_path})" if debug_path else ""
@@ -106,28 +132,26 @@ async def extract_video_list(state: AgentState) -> dict:
     async with camoufox_session() as page:
         await page.goto(state.playlist_url, wait_until="domcontentloaded")
         await _dismiss_consent_if_present(page)
-        try:
-            await page.wait_for_selector(
-                PLAYLIST_ITEM_SELECTOR, timeout=DEFAULT_WAIT_MS
-            )
-        except PlaywrightTimeoutError as e:
+
+        strategy = await _detect_playlist_strategy(page)
+        if strategy is None:
             debug_path = await _capture_debug_artifacts(page, stage="extract_video_list")
             hint = f" (screenshot saved to {debug_path})" if debug_path else ""
             return {
                 "errors": [
                     VideoError(
                         stage="extract_video_list",
-                        message=f"No playlist items found: {e}{hint}",
+                        message=f"No playlist items found (all selector strategies failed){hint}",
                     )
                 ]
             }
 
-        items = await page.query_selector_all(PLAYLIST_ITEM_SELECTOR)
+        items = await page.query_selector_all(strategy["item"])
         for position, item in enumerate(items, start=1):
             if len(videos) >= settings.max_videos_per_run:
                 break
             try:
-                title_el = await item.query_selector(PLAYLIST_ITEM_TITLE_SELECTOR)
+                title_el = await item.query_selector(strategy["title"])
                 if title_el is None:
                     continue
                 title = (await title_el.inner_text()).strip()
@@ -141,7 +165,7 @@ async def extract_video_list(state: AgentState) -> dict:
                 videos.append(
                     VideoRef(video_id=video_id, url=url, title=title, position=position)
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one bad item shouldn't kill discovery
                 logger.warning("Skipping unparsable playlist item at position %d: %s", position, e)
                 continue
 
@@ -166,6 +190,7 @@ async def extract_video_list(state: AgentState) -> dict:
 
 # Node: open_video
 async def open_video(state: AgentState) -> dict:
+    """Pops the next pending video ID off the queue and sets it as current."""
     if not state.pending_video_ids:
         return {}
 
@@ -294,8 +319,6 @@ async def handle_error(state: AgentState) -> dict:
 
 # Node: write_markdown
 async def write_markdown(state: AgentState) -> dict:
-    """Renders all accumulated notes (and any errors) into a single Markdown
-    digest and writes it to OUTPUT_DIR."""
     settings.ensure_dirs()
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     out_path = Path(settings.output_dir) / f"digest_{timestamp}.md"
