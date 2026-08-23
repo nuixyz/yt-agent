@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Playwright (and therefore Camoufox) launches the browser as a subprocess.
+# On Windows, only the Proactor event loop supports asyncio subprocess
+# creation -- the Selector loop raises NotImplementedError. uvicorn doesn't
+# always default to Proactor (particularly with --reload), so we force it
+# here, before uvicorn or anything else creates an event loop.
+if sys.platform == "win32":
+    import asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -76,7 +87,7 @@ class TriggerResponse(BaseModel):
     digest_markdown: str
 
 
-# Core run logic
+# Core run logic (shared by /trigger and the scheduler)
 async def _run_pipeline(playlist_url: str) -> TriggerResponse:
     initial_state = AgentState(playlist_url=playlist_url)
     result = await app_graph.ainvoke(initial_state)
@@ -126,6 +137,7 @@ async def health() -> dict:
 async def trigger(request: TriggerRequest) -> TriggerResponse:
     try:
         return await _run_pipeline(request.playlist_url)
-    except Exception as e:  # noqa: BLE001 - surface as a clean 500 to the caller
+    except Exception as e:
         logger.exception("Pipeline run failed for %s", request.playlist_url)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        detail = str(e) or type(e).__name__
+        raise HTTPException(status_code=500, detail=detail) from e
