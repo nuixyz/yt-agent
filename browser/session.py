@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube"
 LOGIN_CHECK_URL = "https://www.youtube.com"
-
 SIGNED_IN_SELECTOR = "button#avatar-btn"
 
 
@@ -50,7 +49,10 @@ async def camoufox_session(
         try:
             yield page
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 async def is_logged_in(page: Page, *, timeout_ms: int = 8000) -> bool:
@@ -64,26 +66,43 @@ async def is_logged_in(page: Page, *, timeout_ms: int = 8000) -> bool:
 
 async def run_interactive_login() -> None:
     print("Opening a visible browser window for one-time login...")
-    print("Please sign in to your Google account (complete 2FA if prompted).")
+    print("Please sign in to your Google account.")
     print("This window will close automatically once sign-in is detected.\n")
 
     async with camoufox_session(headless=False) as page:
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-        print("Waiting for sign-in to complete (checking every few seconds)...")
-        signed_in = False
-        for _ in range(120):  # up to ~10 minutes
-            try:
-                await page.wait_for_selector(
-                    SIGNED_IN_SELECTOR, timeout=5000
-                )
-                signed_in = True
-                break
-            except Exception:
-                await page.goto(LOGIN_CHECK_URL, wait_until="domcontentloaded")
-                await asyncio.sleep(5)
+        print("Waiting for sign-in to complete...")
 
-        if signed_in:
+        signed_in = False
+        browser_closed = False
+
+        for _ in range(180):  # up to ~15 minutes, checked every 5s
+            await asyncio.sleep(5)
+
+            try:
+                current_url = page.url
+            except Exception:
+                browser_closed = True
+                break
+
+            if "youtube.com" in current_url and "accounts.google.com" not in current_url:
+                try:
+                    await page.wait_for_selector(
+                        SIGNED_IN_SELECTOR, timeout=8000
+                    )
+                    signed_in = True
+                    break
+                except Exception:
+                    continue
+
+        if browser_closed:
+            print(
+                "\nThe browser window was closed before sign-in completed. "
+                "Re-run 'python -m browser.session --login' to try again, "
+                "and leave the window open until it closes itself."
+            )
+        elif signed_in:
             print("\nSign-in detected. Session saved to:", _profile_dir())
         else:
             print(
