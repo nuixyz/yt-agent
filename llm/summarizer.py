@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -43,8 +44,6 @@ code fences, and no explanation before or after it."""
 
 
 def _extract_json(raw: str) -> dict:
-    """Best-effort extraction of a JSON object from model output, tolerating
-    stray markdown fences some models add despite instructions."""
     text = raw.strip()
     fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if fence_match:
@@ -53,7 +52,18 @@ def _extract_json(raw: str) -> dict:
         brace_match = re.search(r"\{.*\}", text, re.DOTALL)
         if brace_match:
             text = brace_match.group(0)
-    return json.loads(text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    normalized = re.sub(r"\btrue\b", "True", text)
+    normalized = re.sub(r"\bfalse\b", "False", normalized)
+    normalized = re.sub(r"\bnull\b", "None", normalized)
+    result = ast.literal_eval(normalized)
+    if not isinstance(result, dict):
+        raise json.JSONDecodeError("Parsed value was not a JSON object", text, 0)
+    return result
 
 
 def _build_user_prompt(video: VideoRef, transcript: str) -> str:
@@ -102,7 +112,7 @@ async def summarize_transcript(video: VideoRef, transcript: str) -> StudyNote:
         )
 
     raw_retry = await _call_ollama(SYSTEM_PROMPT + RETRY_SYSTEM_SUFFIX, user_prompt)
-    payload = _extract_json(raw_retry) 
+    payload = _extract_json(raw_retry)
     return StudyNote(
         video_id=video.video_id,
         title=video.title,

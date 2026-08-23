@@ -32,15 +32,6 @@ from llm.summarizer import summarize_transcript
 
 logger = logging.getLogger(__name__)
 
-# --- Selectors (YouTube's DOM; kept centralized so they're easy to patch) ---
-#
-# YouTube has migrated playlist item rendering from the old
-# `ytd-playlist-video-renderer` custom element to a newer `yt-lockup-view-model`
-# component (observed via debug HTML dumps on 2026-08-23). Rather than
-# hardcode a single selector that will break again the next time YouTube
-# changes this, we try a list of strategies in order and use whichever one
-# actually matches -- this is also just genuinely more resilient to A/B
-# tests, where different accounts can see different DOM structures.
 PLAYLIST_ITEM_STRATEGIES: list[dict[str, str]] = [
     {
         "item": "yt-lockup-view-model",
@@ -65,6 +56,42 @@ TRANSCRIPT_BUTTON_SELECTOR = 'button[aria-label*="transcript" i]'
 # display:none duplicate even while the "real" one is sitting on screen.
 # This helper explicitly finds and clicks whichever match is actually
 # visible.
+async def _find_expanded_panel(page: Page, selector: str, *, timeout_ms: int = DEFAULT_WAIT_MS):
+    deadline = timeout_ms / 1000
+    elapsed = 0.0
+    interval = 0.5
+    while elapsed < deadline:
+        candidates = await page.query_selector_all(selector)
+        for el in candidates:
+            try:
+                visibility_attr = await el.get_attribute("visibility")
+                if visibility_attr == "ENGAGEMENT_PANEL_VISIBILITY_EXPANDED":
+                    return el
+            except Exception:
+                continue
+        await page.wait_for_timeout(int(interval * 1000))
+        elapsed += interval
+
+    return await _find_first_visible(page, selector, timeout_ms=2000)
+
+
+async def _find_first_visible(page: Page, selector: str, *, timeout_ms: int = DEFAULT_WAIT_MS):
+    deadline = timeout_ms / 1000
+    elapsed = 0.0
+    interval = 0.5
+    while elapsed < deadline:
+        candidates = await page.query_selector_all(selector)
+        for el in candidates:
+            try:
+                if await el.is_visible():
+                    return el
+            except Exception:
+                continue
+        await page.wait_for_timeout(int(interval * 1000))
+        elapsed += interval
+    return None
+
+
 async def _click_first_visible(
     page: Page, selector: str, *, timeout_ms: int = DEFAULT_WAIT_MS
 ) -> bool:
@@ -120,8 +147,18 @@ async def _expand_description_if_present(page: Page, *, timeout_ms: int = 4000) 
             continue
 
 
-TRANSCRIPT_SEGMENT_SELECTOR = "ytd-transcript-segment-renderer"
-TRANSCRIPT_PANEL_SELECTOR = "ytd-transcript-segment-list-renderer"
+# YouTube's transcript panel structure has changed significantly (confirmed
+# via debug HTML dumps on 2026-08-23): the old ytd-transcript-segment-renderer
+# / ytd-transcript-segment-list-renderer tags no longer exist anywhere in the
+# DOM. The transcript now opens as a lazily-populated engagement panel
+# (target-id containing "transcript") with no fixed per-line child element --
+# content is rendered dynamically, so instead of depending on a specific
+# child tag we wait for the panel's text content to actually populate, then
+# extract lines by their timestamp pattern (resilient to internal markup
+# changes since it depends on visible text shape, not DOM structure).
+TRANSCRIPT_PANEL_SELECTOR = "ytd-engagement-panel-section-list-renderer[target-id*='transcript']"
+TIMESTAMP_LINE_RE = re.compile(r"(\d{1,2}:\d{2}(?::\d{2})?)\s*\n?\s*([^\n]+)")
+MIN_PANEL_TEXT_LENGTH = 60
 
 # YouTube/Google sometimes shows a cookie-consent interstitial ("Before you
 # continue to YouTube") on a fresh browser profile, even when the session is
@@ -345,6 +382,18 @@ async def extract_transcript(state: AgentState) -> dict:
         try:
             await page.goto(video.url, wait_until="domcontentloaded")
 
+            # YouTube is a heavy SPA -- domcontentloaded fires long before
+            # Polymer components finish upgrading/rendering. Searching for
+            # buttons too early can miss them even though they're about to
+            # appear (observed directly: a debug HTML dump captured mid-load
+            # was roughly half the size of a fully-rendered page's dump).
+            # Wait for the watch-page metadata block as a stable readiness
+            # signal before touching anything else.
+            try:
+                await page.wait_for_selector("ytd-watch-metadata", timeout=DEFAULT_WAIT_MS)
+            except PlaywrightTimeoutError:
+                pass  # fall through and let the real failure surface below
+
             # Expand description area first; the transcript button often
             # only renders once the description panel is open.
             await _expand_description_if_present(page)
@@ -356,23 +405,36 @@ async def extract_transcript(state: AgentState) -> dict:
                     "(matches existed in the DOM but none were visible)."
                 )
 
-            await page.wait_for_selector(
-                TRANSCRIPT_PANEL_SELECTOR, timeout=DEFAULT_WAIT_MS
-            )
-            # Give lazy-loaded segments a moment to populate after the panel
-            # itself is present (dynamic wait, not a blind sleep -- we wait
-            # for at least one segment node to exist).
-            await page.wait_for_selector(
-                TRANSCRIPT_SEGMENT_SELECTOR, timeout=DEFAULT_WAIT_MS
-            )
+            panel = await _find_expanded_panel(page, TRANSCRIPT_PANEL_SELECTOR)
+            if panel is None:
+                raise PlaywrightTimeoutError(
+                    "Transcript panel did not become visible after clicking "
+                    "'Show transcript'."
+                )
 
-            segments = await page.query_selector_all(TRANSCRIPT_SEGMENT_SELECTOR)
-            lines: list[str] = []
-            for seg in segments:
-                text = (await seg.inner_text()).strip()
-                if text:
-                    lines.append(text.replace("\n", " "))
+            # The panel's content renders lazily and asynchronously -- there's
+            # no fixed child tag to wait on (see selector comment above), so
+            # we poll the panel's own text content until it's clearly
+            # populated with more than just its header/tab labels.
+            try:
+                await page.wait_for_function(
+                    "(el) => el.innerText && el.innerText.trim().length > %d"
+                    % MIN_PANEL_TEXT_LENGTH,
+                    arg=panel,
+                    timeout=DEFAULT_WAIT_MS,
+                )
+            except PlaywrightTimeoutError as e:
+                raise PlaywrightTimeoutError(
+                    f"Transcript panel opened but no content loaded in time: {e}"
+                )
 
+            panel_text = await panel.inner_text()
+            matches = TIMESTAMP_LINE_RE.findall(panel_text)
+            lines = [
+                f"{ts.strip()} - {text.strip()}"
+                for ts, text in matches
+                if text.strip()
+            ]
             transcript = "\n".join(lines)
 
         except PlaywrightTimeoutError as e:
