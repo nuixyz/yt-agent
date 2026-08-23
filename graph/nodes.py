@@ -417,16 +417,21 @@ async def extract_transcript(state: AgentState) -> dict:
             # we poll the panel's own text content until it's clearly
             # populated with more than just its header/tab labels.
             try:
-                await page.wait_for_function(
-                    "(el) => el.innerText && el.innerText.trim().length > %d"
-                    % MIN_PANEL_TEXT_LENGTH,
-                    arg=panel,
-                    timeout=DEFAULT_WAIT_MS,
-                )
+              await page.wait_for_function(
+                """(el) => {
+                const text = el.innerText || '';
+                const stillLoading = el.querySelector('tp-yt-paper-spinner[active]');
+                return !stillLoading && text.trim().length > %d;
+                }"""
+                % MIN_PANEL_TEXT_LENGTH,
+                arg=panel,
+                timeout=30000,
+              )
             except PlaywrightTimeoutError as e:
-                raise PlaywrightTimeoutError(
-                    f"Transcript panel opened but no content loaded in time: {e}"
-                )
+              raise PlaywrightTimeoutError(
+                f"Transcript panel opened but content never finished loading "
+                f"(stuck on loading spinner past 30000ms): {e}"
+              )
 
             panel_text = await panel.inner_text()
             matches = TIMESTAMP_LINE_RE.findall(panel_text)

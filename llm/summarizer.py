@@ -42,6 +42,15 @@ IMPORTANT: Your previous response could not be parsed as valid JSON. \
 Return ONLY the JSON object this time, with no surrounding text, no markdown \
 code fences, and no explanation before or after it."""
 
+_BARE_TIMESTAMP_ITEM_RE = re.compile(
+    r'(?<![\w"\'])(\d{1,2}:\d{2}(?::\d{2})?\s*-\s*[^,\]"]+?)(?=\s*[,\]])'
+)
+
+def _quote_bare_unquoted_timestamps(text: str) -> str:
+    def _wrap(m: re.Match) -> str:
+        inner = m.group(1).strip().replace('"', '\\"')
+        return f'"{inner}"'
+    return _BARE_TIMESTAMP_ITEM_RE.sub(_wrap, text)
 
 def _extract_json(raw: str) -> dict:
     text = raw.strip()
@@ -52,6 +61,8 @@ def _extract_json(raw: str) -> dict:
         brace_match = re.search(r"\{.*\}", text, re.DOTALL)
         if brace_match:
             text = brace_match.group(0)
+
+    text = _quote_bare_unquoted_timestamps(text)
 
     try:
         return json.loads(text)
