@@ -1,21 +1,3 @@
-"""
-LangGraph node functions for the YouTube Study Agent.
-
-Each node takes the current AgentState and returns a partial state update
-(a dict of the fields it changed). LangGraph merges these into the running
-state using each field's reducer (see graph/state.py).
-
-Nodes are deliberately narrow and single-purpose so each is independently
-testable:
-    navigate_playlist    -> opens the playlist page
-    extract_video_list   -> scrapes video refs, applies the run cap, seeds queue
-    open_video            -> opens the next pending video
-    extract_transcript    -> pulls transcript text via DOM, with dynamic waits
-    summarize_node        -> calls the LLM to turn a transcript into a StudyNote
-    write_markdown         -> renders all notes/errors to a Markdown digest on disk
-    handle_error            -> records a VideoError and advances the queue
-"""
-
 from __future__ import annotations
 
 import logging
@@ -47,15 +29,7 @@ DEFAULT_WAIT_MS = 15000
 
 TRANSCRIPT_BUTTON_SELECTOR = 'button[aria-label*="transcript" i]'
 
-# YouTube renders multiple copies of some buttons for different layouts/
-# breakpoints and toggles visibility via CSS rather than removing the
-# duplicates from the DOM (confirmed via debug HTML on 2026-08-23: the
-# transcript button selector matched 4 elements simultaneously). A plain
-# wait_for_selector() locks onto the *first* DOM match regardless of
-# whether it's the visible one, so it can time out waiting on a
-# display:none duplicate even while the "real" one is sitting on screen.
-# This helper explicitly finds and clicks whichever match is actually
-# visible.
+
 async def _find_expanded_panel(page: Page, selector: str, *, timeout_ms: int = DEFAULT_WAIT_MS):
     deadline = timeout_ms / 1000
     elapsed = 0.0
@@ -95,9 +69,6 @@ async def _find_first_visible(page: Page, selector: str, *, timeout_ms: int = DE
 async def _click_first_visible(
     page: Page, selector: str, *, timeout_ms: int = DEFAULT_WAIT_MS
 ) -> bool:
-    """Polls for at least one element matching `selector` to be genuinely
-    visible (not just present in the DOM) and clicks it. Returns True on
-    success, False if none became visible within the timeout."""
     deadline = timeout_ms / 1000
     elapsed = 0.0
     interval = 0.5
@@ -116,10 +87,6 @@ async def _click_first_visible(
     return False
 
 
-# Candidate selectors for the "expand description" toggle, tried in order.
-# YouTube has changed this element's id/structure across redesigns (the
-# playlist page migration to yt-lockup-view-model suggests the watch page
-# has drifted too), so we don't rely on a single hardcoded id.
 EXPAND_DESCRIPTION_SELECTORS = [
     "#expand",
     "tp-yt-paper-button#expand",
@@ -129,9 +96,6 @@ EXPAND_DESCRIPTION_SELECTORS = [
 
 
 async def _expand_description_if_present(page: Page, *, timeout_ms: int = 4000) -> None:
-    """Best-effort click of the description's expand/'...more' toggle,
-    trying several known selector variants. Silently does nothing if none
-    match -- the description may already be expanded, or absent."""
     for selector in EXPAND_DESCRIPTION_SELECTORS:
         try:
             btn = await page.wait_for_selector(selector, timeout=timeout_ms)
@@ -147,25 +111,11 @@ async def _expand_description_if_present(page: Page, *, timeout_ms: int = 4000) 
             continue
 
 
-# YouTube's transcript panel structure has changed significantly (confirmed
-# via debug HTML dumps on 2026-08-23): the old ytd-transcript-segment-renderer
-# / ytd-transcript-segment-list-renderer tags no longer exist anywhere in the
-# DOM. The transcript now opens as a lazily-populated engagement panel
-# (target-id containing "transcript") with no fixed per-line child element --
-# content is rendered dynamically, so instead of depending on a specific
-# child tag we wait for the panel's text content to actually populate, then
-# extract lines by their timestamp pattern (resilient to internal markup
-# changes since it depends on visible text shape, not DOM structure).
 TRANSCRIPT_PANEL_SELECTOR = "ytd-engagement-panel-section-list-renderer[target-id*='transcript']"
 TIMESTAMP_LINE_RE = re.compile(r"(\d{1,2}:\d{2}(?::\d{2})?)\s*\n?\s*([^\n]+)")
 MIN_PANEL_TEXT_LENGTH = 60
 
-# YouTube/Google sometimes shows a cookie-consent interstitial ("Before you
-# continue to YouTube") on a fresh browser profile, even when the session is
-# otherwise authenticated. It renders on top of the page and blocks the
-# playlist/video content underneath from ever appearing, which looks
-# identical to a normal timeout unless you know to look for it. We try to
-# dismiss it opportunistically before waiting on real page content.
+
 CONSENT_BUTTON_SELECTORS = [
     "button:has-text('Accept all')",
     "button:has-text('I agree')",
@@ -177,9 +127,6 @@ DEBUG_DIR = Path("./outputs/_debug")
 
 
 async def _detect_playlist_strategy(page: Page) -> dict[str, str] | None:
-    """Tries each known playlist-item selector strategy in order and returns
-    the first one that actually matches the current page's DOM. Returns
-    None if none of them do (caller treats this as a load failure)."""
     for strategy in PLAYLIST_ITEM_STRATEGIES:
         try:
             await page.wait_for_selector(
@@ -193,20 +140,17 @@ async def _detect_playlist_strategy(page: Page) -> dict[str, str] | None:
 
 
 async def _dismiss_consent_if_present(page: Page, *, timeout_ms: int = 3000) -> None:
-    """Best-effort click of a cookie-consent dialog if one is present.
-    Silently does nothing if no such dialog appears within the short
-    timeout -- this must never block the main flow."""
     for selector in CONSENT_BUTTON_SELECTORS:
         try:
             btn = await page.wait_for_selector(selector, timeout=timeout_ms)
             if btn:
                 await btn.click()
                 logger.info("Dismissed a consent dialog via selector: %s", selector)
-                await page.wait_for_timeout(1000)  # let the dialog close/animate out
+                await page.wait_for_timeout(1000)  # let the dialog close
                 return
         except PlaywrightTimeoutError:
             continue
-        except Exception as e:  # noqa: BLE001 - never let consent-handling break the run
+        except Exception as e:
             logger.debug("Consent dismissal attempt failed for %s: %s", selector, e)
             continue
 
@@ -228,7 +172,7 @@ async def _capture_debug_artifacts(page: Page, *, stage: str, video_id: str = "p
 
         logger.info("Saved debug artifacts: %s , %s", screenshot_path, html_path)
         return screenshot_path
-    except Exception as e:  # noqa: BLE001 - debug capture must never mask the real error
+    except Exception as e:
         logger.warning("Failed to capture debug artifacts: %s", e)
         return None
 
@@ -268,8 +212,6 @@ async def navigate_playlist(state: AgentState) -> dict:
                     )
                 ]
             }
-    # Nothing to persist in state here beyond confirming success; the real
-    # extraction (which needs its own page context) happens next.
     return {}
 
 
@@ -317,7 +259,7 @@ async def extract_video_list(state: AgentState) -> dict:
                 videos.append(
                     VideoRef(video_id=video_id, url=url, title=title, position=position)
                 )
-            except Exception as e:  # noqa: BLE001 - one bad item shouldn't kill discovery
+            except Exception as e:
                 logger.warning("Skipping unparsable playlist item at position %d: %s", position, e)
                 continue
 
@@ -353,7 +295,6 @@ async def open_video(state: AgentState) -> dict:
     video = next((v for v in state.videos if v.video_id == next_id), None)
 
     if video is None:
-        # Shouldn't happen, but keep the queue moving rather than stalling.
         return {
             "pending_video_ids": remaining,
             "errors": [
@@ -381,21 +322,10 @@ async def extract_transcript(state: AgentState) -> dict:
     async with camoufox_session() as page:
         try:
             await page.goto(video.url, wait_until="domcontentloaded")
-
-            # YouTube is a heavy SPA -- domcontentloaded fires long before
-            # Polymer components finish upgrading/rendering. Searching for
-            # buttons too early can miss them even though they're about to
-            # appear (observed directly: a debug HTML dump captured mid-load
-            # was roughly half the size of a fully-rendered page's dump).
-            # Wait for the watch-page metadata block as a stable readiness
-            # signal before touching anything else.
             try:
                 await page.wait_for_selector("ytd-watch-metadata", timeout=DEFAULT_WAIT_MS)
             except PlaywrightTimeoutError:
-                pass  # fall through and let the real failure surface below
-
-            # Expand description area first; the transcript button often
-            # only renders once the description panel is open.
+                pass
             await _expand_description_if_present(page)
 
             clicked = await _click_first_visible(page, TRANSCRIPT_BUTTON_SELECTOR)
@@ -412,10 +342,6 @@ async def extract_transcript(state: AgentState) -> dict:
                     "'Show transcript'."
                 )
 
-            # The panel's content renders lazily and asynchronously -- there's
-            # no fixed child tag to wait on (see selector comment above), so
-            # we poll the panel's own text content until it's clearly
-            # populated with more than just its header/tab labels.
             try:
               await page.wait_for_function(
                 """(el) => {
@@ -487,7 +413,7 @@ async def summarize_node(state: AgentState) -> dict:
 
     try:
         note: StudyNote = await summarize_transcript(video=video, transcript=transcript)
-    except Exception as e:  # noqa: BLE001 - LLM/parsing failures shouldn't kill the run
+    except Exception as e:
         return {
             "current_video": None,
             "current_transcript": None,
@@ -522,8 +448,6 @@ async def handle_error(state: AgentState) -> dict:
 # Node: write_markdown
 # ---------------------------------------------------------------------------
 async def write_markdown(state: AgentState) -> dict:
-    """Renders all accumulated notes (and any errors) into a single Markdown
-    digest and writes it to OUTPUT_DIR."""
     settings.ensure_dirs()
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     out_path = Path(settings.output_dir) / f"digest_{timestamp}.md"
