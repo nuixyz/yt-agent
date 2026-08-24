@@ -26,8 +26,6 @@ Built for the "Autonomous Browser Agent with Camoufox, LangGraph & Local/Fine-Tu
 - [Output format](#output-format)
 - [Error handling & resilience](#error-handling--resilience)
 - [Design decisions](#design-decisions)
-- [Rubric coverage](#rubric-coverage)
-- [Bonus: fine-tuned local LLM](#bonus-fine-tuned-local-llm)
 - [Troubleshooting](#troubleshooting)
 - [Limitations & future work](#limitations--future-work)
 
@@ -38,7 +36,7 @@ Built for the "Autonomous Browser Agent with Camoufox, LangGraph & Local/Fine-Tu
 Point it at a YouTube playlist URL, and it will:
 
 1. Launch **Camoufox** (an anti-detect browser) reusing a persistent, already-authenticated session.
-2. Open the playlist and discover videos (capped to a configurable number per run).
+2. Open the playlist and discover videos (capped to a configurable number per run - default: 5).
 3. For each video: open it, expand and extract its transcript from the DOM, and pass the transcript to a **local LLM** running in Ollama.
 4. The LLM returns a structured note — summary, key concepts, notable timestamps, and action items — validated against a strict schema.
 5. All notes (plus any per-video errors) are compiled into a single **Markdown digest** and saved to `outputs/`.
@@ -88,7 +86,7 @@ The entire flow is orchestrated as a **LangGraph** state machine, and triggered 
                              END
 ```
 
-Key design point: **a failed video never blocks the rest of the playlist.** If a transcript can't be extracted or the LLM output can't be parsed, that failure is recorded as a structured error and the graph immediately moves to the next queued video — no retries, no aborts.
+**a failed video never blocks the rest of the playlist.** If a transcript can't be extracted or the LLM output can't be parsed, that failure is recorded as a structured error and the graph immediately moves to the next queued video — no retries, no aborts.
 
 ---
 
@@ -101,22 +99,16 @@ youtube-study-agent/
 ├── .env.example               # all configurable settings, documented
 ├── config.py                   # pydantic-settings config, loaded from .env
 ├── browser/
-│   ├── __init__.py
 │   └── session.py                # Camoufox launch, persistent profile, interactive login
 ├── graph/
-│   ├── __init__.py
 │   ├── state.py                    # AgentState / VideoRef / StudyNote / VideoError schemas
 │   ├── nodes.py                     # the 7 node functions
 │   └── build.py                      # StateGraph wiring, conditional routing, compiled app
 ├── llm/
-│   ├── __init__.py
 │   └── summarizer.py                  # Ollama call, prompt, JSON extraction + retry
 ├── api/
-│   ├── __init__.py
 │   └── main.py                          # FastAPI app: POST /trigger, GET /health, scheduler
 ├── outputs/                                # generated Markdown digests land here
-├── finetune/                                # optional bonus: LoRA fine-tuning script
-└── demo/                                      # screen recording / terminal log
 ```
 
 ---
@@ -322,12 +314,6 @@ This video introduces the basic building blocks of neural networks...
 
 ---
 
-## Errors
-- `extract_transcript` — https://www.youtube.com/watch?v=xyz789: Transcript unavailable or failed to load
-```
-
----
-
 ## Error handling & resilience
 
 - **Per-video isolation:** a bad transcript or a malformed LLM response on one video is recorded as a `VideoError` and the pipeline moves straight to the next video — deliberately **no retries** at the graph level, so one problematic video never stalls or aborts the whole run.
@@ -339,35 +325,11 @@ This video introduces the basic building blocks of neural networks...
 
 ## Design decisions
 
-A few choices worth calling out (also see inline comments in the code):
-
 - **DOM-scraped transcripts, not `youtube-transcript-api`.** This was chosen deliberately over the simpler library-based approach because it exercises exactly what the rubric weights heavily: resilient element discovery and dynamic DOM waits, using real `wait_for_selector` calls at each stage rather than a single library call.
-- **Interactive login, not automated TOTP.** Simpler and safer than storing credentials/TOTP secrets in `.env`; the persistent Camoufox profile means this is a true one-time cost.
 - **Per-video `StudyNote`, not one aggregated summary.** Keeps `summarize_node` isolated and independently testable (one transcript in, one validated note out), and produces a more genuinely useful digest.
 - **Capped run size (`MAX_VIDEOS_PER_RUN`, default 5).** Keeps demo runs fast and avoids long-playlist timeouts; configurable via `.env` if you want to process more.
 - **Fail immediately, no retry, on a bad video.** Keeps the control flow simple and predictable, and matches the actual failure modes here (a missing transcript or a bad LLM response usually won't fix itself on retry within the same run).
 - **Synchronous `/trigger`.** For a capped run this completes in well under a couple of minutes, and a single blocking call is far easier to demo and reason about than adding a job store/polling endpoint the rubric doesn't ask for.
-- **Ollama-only LLM backend.** Matches the challenge's "local LLM" emphasis directly; no external API dependency or key management needed to run this end-to-end.
-
----
-
-## Rubric coverage
-
-| Area | Weight | How this project addresses it |
-|---|---|---|
-| Browser & Auth (Camoufox) | 30% | Persistent profile via `persistent_context=True`; one-time interactive login; `wait_for_selector` used throughout instead of fixed sleeps. |
-| LangGraph & Code Architecture | 30% | 7 isolated, single-purpose nodes; Pydantic `AgentState` with additive reducers; conditional routing for success/failure/loop-continuation; clean async FastAPI layer. |
-| LLM Practicality & Prompting | 20% | Strict JSON-only prompt validated against a Pydantic schema; one retry on malformed output; transcript truncation to respect context limits. |
-| Ingenuity & Resilience | 20% | Per-video error isolation (a bad video never aborts the run); structured error reporting in both the digest and the API response; configurable video cap. |
-| Fine-Tuned LLM (Bonus) | +15% | See below. |
-
----
-
-## Bonus: fine-tuned local LLM
-
-*(Optional — see `finetune/` if implemented.)*
-
-If pursued, this would involve fine-tuning a lightweight model (e.g. Qwen-2.5 or Phi-3) via Unsloth/LoRA specifically on summarization / Markdown-structuring / action-item extraction, exporting to GGUF, and importing into Ollama as a custom model tag (set via `OLLAMA_MODEL` in `.env`) — requiring no code changes elsewhere in the project, since `llm/summarizer.py` only depends on the configured model name.
 
 ---
 
@@ -396,6 +358,6 @@ Try a different model — smaller/less-instructable models sometimes ignore form
 ## Limitations & future work
 
 - Transcript extraction relies on YouTube's current DOM structure and will need selector updates if YouTube changes its UI.
-- No automatic retry at the graph level for transient failures (e.g. a slow network causing a one-off timeout) — by design, but worth reconsidering if run against flakier networks.
+- No automatic retry at the graph level for transient failures (e.g. a slow network causing a one-off timeout)
 - The background scheduler runs against a single fixed `DEFAULT_PLAYLIST_URL`; supporting multiple scheduled playlists would need a small extension (e.g. a list of playlist configs instead of one URL).
 - No persistence/database layer — each run's digest is a standalone file; there's no cross-run deduplication if the same video appears in multiple runs.
