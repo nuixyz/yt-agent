@@ -311,6 +311,7 @@ This video introduces the basic building blocks of neural networks...
 **Action items:**
 - [ ] Review the chain rule before the next video
 - [ ] Implement a single-layer perceptron from scratch
+```
 
 ---
 
